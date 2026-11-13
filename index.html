@@ -54,6 +54,7 @@
 <ul id="live"></ul>
 <p class="hint">When you click <b>Connect the Uno</b>, a list pops up: click the entry with <b>usbmodem</b> or <b>Arduino</b> in its name, then click <b>Connect</b> inside the pop-up. You only need to do this once.</p>
 <button id="connect">Connect the Uno</button>
+<button id="disconnect" disabled>Disconnect (lets VS Code upload)</button>
 <button id="talk">Hold to talk</button>
 <input id="text" placeholder="...or type a sentence here and press Enter">
 <pre id="log"></pre>
@@ -178,50 +179,73 @@ async function respond(heard) {
   busy = false;
 }
 
-let rec = null, holdTimer = null, holdStart = 0;
+let rec = null, recRunning = false, holding = false, holdTimer = null, holdStart = 0, collected = '';
 
-function startHold() {  // the Uno button went down (or the Talk button on this page)
+function startHold() {  // the Uno button went down (or the Hold to talk button on this page)
   if (listening || busy) return;
   if (!SR) { send('i'); hint('No recognition'); return; }
+  listening = true;
+  holding = true;
+  collected = '';
+  holdStart = Date.now();
+  send('l');
+  log('Listening: hold the button and speak...');
+  holdTimer = setTimeout(stopHold, 60000);  // safety: never listen longer than 60 seconds
+  runRecognizer();
+}
+
+// Chrome stops its speech recognition by itself after a pause or a time limit. While the button is still
+// held down, simply start it again, and keep everything that was heard so far.
+function runRecognizer() {
   rec = new SR();
   rec.lang = 'en-US';
   rec.interimResults = true;
   rec.continuous = true;
-  let finalText = '', errCode = '';
-  listening = true;
-  holdStart = Date.now();
-  send('l');
-  log('Listening: hold the button and speak...');
+  let errCode = '';
+  rec.onstart = () => { recRunning = true; };
   rec.onresult = e => {
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const r = e.results[i];
-      if (r.isFinal) finalText += r[0].transcript + ' '; else interim += r[0].transcript;
+      if (r.isFinal) collected += r[0].transcript + ' '; else interim += r[0].transcript;
     }
-    if (interim) log('  hearing: ' + interim);
+    if (interim) log('  hearing: ' + (collected + interim).trim());
   };
   rec.onerror = e => { errCode = e.error; };
-  rec.onend = async () => {
-    listening = false;
-    clearTimeout(holdTimer);
-    if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
-      send('i'); hint('Mic blocked');
-      if (isIOS) log('On iPhone/iPad: allow the microphone for this site, and turn on Dictation in Settings > General > Keyboard.');
-      return;
-    }
-    if (errCode === 'audio-capture') { send('i'); hint('No microphone'); return; }
-    if (errCode === 'network') { send('i'); hint('No internet'); return; }
-    if (Date.now() - holdStart < 400) { send('i'); hint('Hold to talk'); return; }  // only tapped
-    if (finalText.trim()) { await respond(finalText.trim()); return; }
-    send('i');
-    hint("Didn't hear you");
+  rec.onend = () => {
+    recRunning = false;
+    const harmless = errCode === '' || errCode === 'no-speech' || errCode === 'aborted';
+    if (holding && harmless) { setTimeout(() => { if (holding) runRecognizer(); }, 150); return; }
+    finishListening(errCode);
   };
-  holdTimer = setTimeout(stopHold, 15000);  // safety: never listen longer than 15 seconds
-  try { rec.start(); } catch (e) { listening = false; send('i'); hint('Mic blocked'); }
+  try { rec.start(); } catch (e) { recRunning = false; finishListening('start-failed'); }
 }
 
 function stopHold() {  // the button was released: finish and answer
-  if (rec && listening) { try { rec.stop(); } catch (e) { /* already stopped */ } }
+  if (!listening) return;
+  holding = false;
+  clearTimeout(holdTimer);
+  if (recRunning) { try { rec.stop(); } catch (e) { finishListening(''); } }  // its onend finishes the job
+  else finishListening('');                                                  // it was between two restarts
+}
+
+async function finishListening(errCode) {
+  if (!listening) return;
+  listening = false;
+  holding = false;
+  clearTimeout(holdTimer);
+  if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+    send('i'); hint('Mic blocked');
+    if (isIOS) log('On iPhone/iPad: allow the microphone for this site, and turn on Dictation in Settings > General > Keyboard.');
+    return;
+  }
+  if (errCode === 'audio-capture') { send('i'); hint('No microphone'); return; }
+  if (errCode === 'network') { send('i'); hint('No internet'); return; }
+  if (errCode === 'start-failed') { send('i'); hint('Mic blocked'); return; }
+  if (Date.now() - holdStart < 400) { send('i'); hint('Hold to talk'); return; }  // only tapped
+  if (collected.trim()) { await respond(collected.trim()); return; }
+  send('i');
+  hint("Didn't hear you");
 }
 
 // ---------- connecting to the Uno ----------
@@ -239,6 +263,7 @@ async function openPort(p) {
   port = p;
   writer = port.writable.getWriter();
   $('connect').disabled = true;
+  $('disconnect').disabled = false;
   live.uno = ['Connected', 'ok']; renderLive();
   log('Connected. Waiting for the Uno to start...');
   await sleep(2200);  // opening the port restarts the Uno
@@ -277,10 +302,19 @@ async function autoConnect() {  // after the first time the browser remembers th
   } catch (e) { /* not allowed yet: wait for the Connect button */ }
 }
 
+let activeReader = null, wantDisconnect = false;
+
+async function disconnect() {  // let go of the Uno so other programs can use it
+  wantDisconnect = true;
+  if (heartbeat) clearInterval(heartbeat);
+  try { if (activeReader) await activeReader.cancel(); } catch (e) { /* already closed */ }
+}
+
 async function readLoop() {
   const dec = new TextDecoder();
   while (port && port.readable) {
     const reader = port.readable.getReader();
+    activeReader = reader;
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -293,7 +327,10 @@ async function readLoop() {
     } catch (e) { log('Serial error: ' + e.message); break; }
     finally { reader.releaseLock(); }
   }
-  log('The Uno was unplugged. Plug it in again, this page connects by itself.');
+  if (wantDisconnect) { wantDisconnect = false; log('Disconnected. The Uno is free now: you can upload from VS Code. Click Connect the Uno to use it here again.'); }
+  else log('The Uno was unplugged. Plug it in again, this page connects by itself.');
+  try { if (writer) writer.releaseLock(); } catch (e) { /* ignore */ }
+  $('disconnect').disabled = true;
   try { if (heartbeat) clearInterval(heartbeat); await port.close(); } catch (e) { /* already gone */ }
   writer = null;
   port = null;
@@ -326,6 +363,7 @@ function showSupport() {
 }
 
 $('connect').onclick = () => { unlockSpeech(); connect(); };
+$('disconnect').onclick = disconnect;
 function unlockSpeech() {  // iPhone and iPad only allow speech after a tap, so speak nothing once during the tap
   if (hasTTS && !unlockSpeech.done) { unlockSpeech.done = true; speechSynthesis.speak(new SpeechSynthesisUtterance('')); }
 }
