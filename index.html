@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Talking face</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 22px; font-weight: 500; }
+  button { font: inherit; padding: 8px 16px; margin: 0 8px 8px 0; cursor: pointer; }
+  input { font: inherit; width: 100%; box-sizing: border-box; padding: 8px; margin: 4px 0 12px; }
+  ul { padding-left: 20px; margin: 8px 0 16px; }
+  .bad { color: #b3261e; }
+  .ok { color: #1b7f3b; }
+  #face { display: block; margin: 8px auto 16px; max-width: 320px; width: 100%; }
+  #face .eye { fill: currentColor; transform-box: fill-box; transform-origin: center; animation: blink 4.5s infinite; }
+  #face .mouth { fill: none; stroke: currentColor; stroke-width: 5; stroke-linecap: round; }
+  #face .open { fill: currentColor; display: none; transform-box: fill-box; transform-origin: center; }
+  #face.speaking .open { display: block; animation: talk .32s infinite alternate; }
+  #face.speaking .mouth, #face.thinking .open { display: none; }
+  #face.thinking .pupilmove { animation: look 2s infinite; }
+  #face.happy .eye { animation: none; }
+  #face.asleep .eye { animation: none; transform: scaleY(.08); }
+  #face .waves, #face .dots, #face .zzz { opacity: 0; font: 22px system-ui; fill: currentColor; }
+  #face.listening .waves { opacity: 1; animation: pulse .8s infinite alternate; }
+  #face.thinking .dots { opacity: 1; }
+  #face.asleep .zzz { opacity: 1; }
+  @keyframes blink { 0%, 94%, 100% { transform: scaleY(1); } 97% { transform: scaleY(.08); } }
+  @keyframes talk { from { transform: scaleY(.35); } to { transform: scaleY(1); } }
+  @keyframes look { 0%, 100% { transform: translate(-5px, -4px); } 50% { transform: translate(6px, -4px); } }
+  @keyframes pulse { from { opacity: .25; } to { opacity: 1; } }
+  pre { background: rgba(127,127,127,.12); padding: 12px; height: 260px; overflow: auto; white-space: pre-wrap; border-radius: 8px; }
+</style>
+</head>
+<body>
+<h1>Talking face</h1>
+<p>Plug the Arduino Uno into this computer, click <b>Connect</b>, choose the Uno in the list, then <b>press and hold</b> the button on the Uno (or hold the <b>Hold to talk</b> button here), speak English, and let go when you finish. No installation needed. On a phone or tablet you can still talk to the face on this screen: tap and hold <b>Hold to talk</b>.</p>
+<svg id="face" viewBox="0 0 320 190" role="img" aria-label="The talking face">
+  <g class="eyes">
+    <ellipse class="eye" cx="95" cy="70" rx="26" ry="32"/>
+    <ellipse class="eye" cx="225" cy="70" rx="26" ry="32"/>
+  </g>
+  <g class="pupilmove"><circle cx="95" cy="70" r="0"/></g>
+  <path class="mouth" d="M110 135 Q160 170 210 135"/>
+  <ellipse class="open" cx="160" cy="145" rx="30" ry="20"/>
+  <text class="waves" x="8" y="75">(((</text><text class="waves" x="268" y="75">)))</text>
+  <text class="dots" x="262" y="30">...</text>
+  <text class="zzz" x="262" y="30">z Z</text>
+</svg>
+<p id="deviceNote"></p>
+<ul id="support"></ul>
+<ul id="live"></ul>
+<button id="connect">Connect the Uno</button>
+<button id="talk">Hold to talk</button>
+<input id="text" placeholder="...or type a sentence here and press Enter">
+<pre id="log"></pre>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function log(msg) { const el = $('log'); el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; }
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const hasSerial = 'serial' in navigator;
+const hasTTS = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+
+let port = null, writer = null, busy = false, listening = false;
+const enc = new TextEncoder();
+
+// ---------- live status ----------
+const live = { uno: ['Not connected', 'bad'], face: ['Idle', 'ok'], hint: ['-', 'ok'] };
+function setFaceLook(name) {  // the picture on this page follows what the Uno face does
+  const css = { Idle: '', Listening: 'listening', Thinking: 'thinking', Speaking: 'speaking', Asleep: 'asleep' }[name] || '';
+  $('face').setAttribute('class', css);
+}
+function renderLive() {
+  $('live').innerHTML =
+    '<li class="' + live.uno[1] + '">Uno: ' + live.uno[0] + '</li>' +
+    '<li class="' + live.face[1] + '">Face: ' + live.face[0] + '</li>' +
+    '<li>Last hint on the Uno screen: ' + live.hint[0] + '</li>';
+}
+const FACE_NAMES = { l: 'Listening', t: 'Thinking', s: 'Speaking', e: 'Idle', i: 'Idle', z: 'Asleep' };
+
+// ---------- talking to the Uno (s speak, e end, l listen, t think, i idle, z sleep, !text hint) ----------
+async function send(s) {
+  if (FACE_NAMES[s]) { live.face = [FACE_NAMES[s], s === 'e' || s === 'i' ? 'ok' : 'warn']; renderLive(); setFaceLook(FACE_NAMES[s]); }
+  if (!writer) return;
+  try { await writer.write(enc.encode(s)); } catch (e) { /* unplugged */ }
+}
+
+// One-line hint on the Uno's second row. Every call shows it, nothing is skipped.
+function hint(text) {
+  log('(!) ' + text);
+  live.hint = [text, 'warn']; renderLive();
+  return send('!' + text.slice(0, 16) + '\n');
+}
+async function hintsInOrder(list) {  // several hints at start-up: one after another (3.5 s each)
+  for (const t of list) { await hint(t); await sleep(3700); }
+}
+
+// ---------- what the face answers (same rules as the Python version) ----------
+const JOKES = [
+  'Why do programmers prefer dark mode? Because light attracts bugs.',
+  'I would tell you a joke about UDP, but you might not get it.',
+  'Why did the robot go on vacation? It needed to recharge its batteries.',
+  "There are ten kinds of people. Those who understand binary, and those who don't."
+];
+function reply(heard) {
+  const t = heard.toLowerCase().trim();
+  let m;
+  if (!t) return "I didn't catch that. Could you say it again?";
+  if ((m = t.match(/^(?:repeat after me|say)\s+(.+)$/))) return m[1];
+  if (/\b(bye|goodbye|good night)\b/.test(t)) return 'Goodbye! See you soon.';
+  if (t.includes('how are you')) return 'I am doing great, thanks for asking!';
+  if (/\b(hello|hi|hey)\b/.test(t)) return 'Hello! I am a little face living on an Arduino. Nice to meet you!';
+  if (t.includes('your name') || t.includes('who are you')) return 'I am Pixel, a tiny robot with a big smile.';
+  if (t.includes('time')) return 'It is ' + new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) + '.';
+  if (/\b(date|day|today)\b/.test(t)) return 'Today is ' + new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) + '.';
+  if (/\b(joke|jokes)\b/.test(t) || t.includes('tell me a job')) return JOKES[Math.floor(Math.random() * JOKES.length)];
+  if (t.includes('thank')) return 'You are welcome!';
+  if (t.includes('what can you do') || t === 'help') return 'You can say hello, ask me the time, ask for a joke, or tell me to say something.';
+  if (t.includes('sing')) return 'La la la! I can only talk, but I try my best.';
+  return 'You said: ' + heard + '. I am still learning, so try asking for the time or a joke.';
+}
+
+// ---------- speaking (the browser's own English voice) ----------
+let voices = [];
+function loadVoices() { voices = hasTTS ? speechSynthesis.getVoices() : []; }
+if (hasTTS) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+
+function pickVoice() {
+  const en = voices.filter(v => /^en[-_]/i.test(v.lang));
+  // nicest first: Karen / Samantha on Apple, the natural voices on Edge and Windows, Google's on Chrome
+  for (const re of [/karen/i, /samantha/i, /aria|jenny|zira/i, /google us english/i, /female/i]) {
+    const v = en.find(x => re.test(x.name));
+    if (v) return v;
+  }
+  return en[0] || null;
+}
+
+async function silentTalk(text) {  // no voice on this computer: the mouth still moves
+  await send('s');
+  await sleep(Math.min(6000, 70 * text.length));
+  await send('e');
+}
+
+function say(text) {
+  return new Promise(resolve => {
+    log('Face: ' + text);
+    if (!hasTTS) { hint('No voice output'); silentTalk(text).then(resolve); return; }
+    const voice = pickVoice();
+    if (!voice) hint('No English voice');
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'en-US';
+    if (voice) u.voice = voice;
+    u.pitch = voice && /karen/i.test(voice.name) ? 1.2 : 1.1;  // a little higher sounds cuter
+    let started = false;
+    u.onstart = () => { started = true; send('s'); };       // the mouth starts exactly when the sound does
+    u.onend = () => { send('e'); resolve(); };
+    u.onerror = () => { send('e'); hint('Voice failed'); resolve(); };
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+    setTimeout(() => { if (!started) speechSynthesis.cancel(); }, 4000);
+  });
+}
+
+// ---------- listening (the browser's speech recognition) ----------
+async function respond(heard) {
+  busy = true;
+  log('You: ' + heard);
+  await send('t');
+  await say(reply(heard));
+  if (/\b(bye|goodbye|good night)\b/i.test(heard)) { await sleep(500); await send('z'); }
+  busy = false;
+}
+
+let rec = null, holdTimer = null, holdStart = 0;
+
+function startHold() {  // the Uno button went down (or the Talk button on this page)
+  if (listening || busy) return;
+  if (!SR) { send('i'); hint('No recognition'); return; }
+  rec = new SR();
+  rec.lang = 'en-US';
+  rec.interimResults = true;
+  rec.continuous = true;
+  let finalText = '', errCode = '';
+  listening = true;
+  holdStart = Date.now();
+  send('l');
+  log('Listening: hold the button and speak...');
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) finalText += r[0].transcript + ' '; else interim += r[0].transcript;
+    }
+    if (interim) log('  hearing: ' + interim);
+  };
+  rec.onerror = e => { errCode = e.error; };
+  rec.onend = async () => {
+    listening = false;
+    clearTimeout(holdTimer);
+    if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+      send('i'); hint('Mic blocked');
+      if (isIOS) log('On iPhone/iPad: allow the microphone for this site, and turn on Dictation in Settings > General > Keyboard.');
+      return;
+    }
+    if (errCode === 'audio-capture') { send('i'); hint('No microphone'); return; }
+    if (errCode === 'network') { send('i'); hint('No internet'); return; }
+    if (Date.now() - holdStart < 400) { send('i'); hint('Hold to talk'); return; }  // only tapped
+    if (finalText.trim()) { await respond(finalText.trim()); return; }
+    send('i');
+    hint("Didn't hear you");
+  };
+  holdTimer = setTimeout(stopHold, 15000);  // safety: never listen longer than 15 seconds
+  try { rec.start(); } catch (e) { listening = false; send('i'); hint('Mic blocked'); }
+}
+
+function stopHold() {  // the button was released: finish and answer
+  if (rec && listening) { try { rec.stop(); } catch (e) { /* already stopped */ } }
+}
+
+// ---------- connecting to the Uno ----------
+let heartbeat = null;
+
+async function openPort(p) {
+  if (writer) return;  // already connected
+  try {
+    await p.open({ baudRate: 115200 });
+  } catch (e) { log('Could not open the Uno: ' + e.message); return; }
+  port = p;
+  writer = port.writable.getWriter();
+  $('connect').disabled = true;
+  live.uno = ['Connected', 'ok']; renderLive();
+  log('Connected. Waiting for the Uno to start...');
+  await sleep(2200);  // opening the port restarts the Uno
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = setInterval(() => send('p'), 1000);  // heartbeat: tells the Uno a computer is there
+  readLoop();
+  const problems = [];
+  if (!SR) problems.push('No recognition');
+  if (!hasTTS) problems.push('No voice output');
+  if (problems.length) hintsInOrder(problems);
+  await say('Hello! Hold my button and talk to me.');
+}
+
+async function connect() {  // the button: pick the Uno from the list (needed only the first time)
+  try { await openPort(await navigator.serial.requestPort()); }
+  catch (e) { log('Could not open the Uno: ' + e.message); }
+}
+
+async function autoConnect() {  // after the first time the browser remembers the Uno
+  if (!hasSerial) return;
+  try {
+    const ports = await navigator.serial.getPorts();
+    if (ports.length === 1) { log('Found the Uno you allowed before. Connecting...'); await openPort(ports[0]); }
+  } catch (e) { /* not allowed yet: wait for the Connect button */ }
+}
+
+async function readLoop() {
+  const dec = new TextDecoder();
+  while (port && port.readable) {
+    const reader = port.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) for (const ch of dec.decode(value)) {
+          if (ch === 'B') startHold();       // the Uno's button was pressed
+          else if (ch === 'U') stopHold();   // ... and released
+        }
+      }
+    } catch (e) { log('Serial error: ' + e.message); break; }
+    finally { reader.releaseLock(); }
+  }
+  log('The Uno was unplugged. Plug it in again, this page connects by itself.');
+  try { if (heartbeat) clearInterval(heartbeat); await port.close(); } catch (e) { /* already gone */ }
+  writer = null;
+  port = null;
+  $('connect').disabled = false;
+  live.uno = ['Not connected - plug it in', 'bad']; live.face = ['Idle', 'ok']; renderLive();
+}
+
+// ---------- page ----------
+const UA = navigator.userAgent || '';
+const isIOS = /iPhone|iPad|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isAndroid = /Android/.test(UA);
+
+function deviceNote() {
+  if (hasSerial) return '';
+  if (isIOS) return 'This is an iPhone or iPad. Apple does not let any browser on it talk to a USB device, so the Uno cannot be connected here. You can still talk to the face on this screen. To use the real Uno, open this page in Chrome or Edge on a computer.';
+  if (isAndroid) return 'This Android browser cannot talk to a USB serial device, so the Uno cannot be connected here. You can still talk to the face on this screen. To use the real Uno, open this page in Chrome or Edge on a computer.';
+  return 'This browser cannot talk to a USB device (Safari and Firefox cannot). You can still talk to the face on this screen. To use the real Uno, open this page in Chrome or Edge.';
+}
+
+function showSupport() {
+  $('deviceNote').textContent = deviceNote();
+  const rows = [
+    [hasSerial, 'USB link to the Uno', 'not supported here (see above)'],
+    [!!SR, 'Speech recognition (needs internet)', 'not supported by this browser: you can type instead'],
+    [hasTTS, 'English voice', 'not supported by this browser']
+  ];
+  $('support').innerHTML = rows.map(([ok, name, bad]) =>
+    '<li class="' + (ok ? 'ok' : 'bad') + '">' + name + ': ' + (ok ? 'OK' : bad) + '</li>').join('');
+  if (!hasSerial) $('connect').disabled = true;
+}
+
+$('connect').onclick = () => { unlockSpeech(); connect(); };
+function unlockSpeech() {  // iPhone and iPad only allow speech after a tap, so speak nothing once during the tap
+  if (hasTTS && !unlockSpeech.done) { unlockSpeech.done = true; speechSynthesis.speak(new SpeechSynthesisUtterance('')); }
+}
+$('talk').addEventListener('pointerdown', e => { e.preventDefault(); unlockSpeech(); startHold(); });
+['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => $('talk').addEventListener(ev, stopHold));
+$('text').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const t = e.target.value.trim();
+  e.target.value = '';
+  if (t && !busy) { unlockSpeech(); respond(t); }
+});
+if (hasSerial) {
+  navigator.serial.addEventListener('connect', e => { log('USB device plugged in.'); openPort(e.target); });
+  navigator.serial.addEventListener('disconnect', () => log('USB cable unplugged.'));
+}
+showSupport();
+renderLive();
+autoConnect();
+window.__face = { reply, pickVoice, hint, startHold, stopHold, live, setFaceLook, deviceNote, hasSerial, hasTTS, hasSR: !!SR };
+</script>
+</body>
+</html>
