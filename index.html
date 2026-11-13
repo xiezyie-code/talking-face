@@ -11,6 +11,7 @@
   button { font: inherit; padding: 8px 16px; margin: 0 8px 8px 0; cursor: pointer; }
   input { font: inherit; width: 100%; box-sizing: border-box; padding: 8px; margin: 4px 0 12px; }
   ul { padding-left: 20px; margin: 8px 0 16px; }
+  .hint { font-size: 14px; opacity: .8; }
   .bad { color: #b3261e; }
   .ok { color: #1b7f3b; }
   #face { display: block; margin: 8px auto 16px; max-width: 320px; width: 100%; }
@@ -51,6 +52,7 @@
 <p id="deviceNote"></p>
 <ul id="support"></ul>
 <ul id="live"></ul>
+<p class="hint">When you click <b>Connect the Uno</b>, a list pops up: click the entry with <b>usbmodem</b> or <b>Arduino</b> in its name, then click <b>Connect</b> inside the pop-up. You only need to do this once.</p>
 <button id="connect">Connect the Uno</button>
 <button id="talk">Hold to talk</button>
 <input id="text" placeholder="...or type a sentence here and press Enter">
@@ -229,7 +231,11 @@ async function openPort(p) {
   if (writer) return;  // already connected
   try {
     await p.open({ baudRate: 115200 });
-  } catch (e) { log('Could not open the Uno: ' + e.message); return; }
+  } catch (e) {
+    log('Could not open the Uno: ' + e.message);
+    log('The Uno is probably busy: another program is using it (the Python program, or the Arduino IDE / VS Code serial monitor). Close it, then try again.');
+    return;
+  }
   port = p;
   writer = port.writable.getWriter();
   $('connect').disabled = true;
@@ -247,8 +253,20 @@ async function openPort(p) {
 }
 
 async function connect() {  // the button: pick the Uno from the list (needed only the first time)
-  try { await openPort(await navigator.serial.requestPort()); }
-  catch (e) { log('Could not open the Uno: ' + e.message); }
+  log('A list of USB devices pops up. Click the entry with "usbmodem" or "Arduino" in its name, then click the Connect button inside that pop-up.');
+  let chosen;
+  try {
+    chosen = await navigator.serial.requestPort();
+  } catch (e) {
+    if (e.name === 'NotFoundError') {  // "No port selected by the user."
+      log('No Uno was chosen. Click "Connect the Uno" again, click the entry with "usbmodem" in the pop-up list, and then press Connect in the pop-up.');
+      log('If the list is empty or has no usbmodem entry: unplug the Uno and plug it in again, use a USB cable that carries data (not a charge-only cable), and close anything else that uses the Uno (Arduino IDE serial monitor, the Python program).');
+    } else {
+      log('Could not open the list of USB devices: ' + e.message);
+    }
+    return;
+  }
+  await openPort(chosen);
 }
 
 async function autoConnect() {  // after the first time the browser remembers the Uno
